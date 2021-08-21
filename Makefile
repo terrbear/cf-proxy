@@ -1,9 +1,11 @@
 
+VERSION := 0.0.6
+
 run:
 	go run main.go
 
 test:
-	aws --endpoint-url http://localhost:8080 \
+	aws --endpoint-url http://localhost:8442 \
 		cloudformation deploy \
 		--stack-name blarg \
 		--template-file sample.json \
@@ -13,7 +15,7 @@ build:
 	go build -o bin/cf-proxy main.go
 
 docker:
-	docker build -t terrbear/cf-proxy .
+	docker build -t terrbear/cf-proxy:$(VERSION) .
 
-publish:
-	docker push terrbear/cf-proxy
+publish: docker
+	docker push terrbear/cf-proxy:$(VERSION)

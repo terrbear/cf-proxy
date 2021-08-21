@@ -30,6 +30,14 @@ func (s *Manager) addStack(name string, stack *stack) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 
+	for i, stack := range s.stacks {
+		if stack.name == name {
+			stack.id = i
+			s.stacks[i] = stack
+			return
+		}
+	}
+
 	stack.id = len(s.stacks)
 	s.stacks = append(s.stacks, stack)
 }
@@ -63,13 +71,19 @@ type stack struct {
 	status status
 }
 
-type describeResponse struct {
-	DescribeStacksResponse struct {
+type describeStacksResponse struct {
+	DescribeStacksResult struct {
 		Stacks struct {
 			Member struct {
 				StackStatus string
-			}
+			} `xml:"member"`
 		}
+	}
+}
+
+type describeChangeSetResponse struct {
+	DescribeChangeSetResult struct {
+		Status string
 	}
 }
 
@@ -117,19 +131,50 @@ func stackFromPayload(payload string) *stack {
 	return &s
 }
 
-func (s *stack) updateFromDescribeResponse(body []byte) {
-	reply := describeResponse{}
+func (s *stack) updateFromDescribeStacksResponse(body []byte) {
+	reply := describeStacksResponse{}
 	err := xml.Unmarshal(body, &reply)
 	if err != nil {
 		log.WithError(err).Info("can't unmarshal aws reply; dying")
 		panic(err)
 	}
-	status := reply.DescribeStacksResponse.Stacks.Member.StackStatus
-	if status == "CREATE_COMPLETE" || status == "DELETE_COMPLETE" {
+	status := reply.DescribeStacksResult.Stacks.Member.StackStatus
+	log.WithField("status", status).Info("new status")
+
+	if status == "CREATE_COMPLETE" || status == "DELETE_COMPLETE" || status == "UPDATE_COMPLETE" {
+		s.end = time.Now()
 		s.status = done
 	} else if strings.Contains(status, "FAILED") || strings.Contains(status, "ROLLBACK") {
+		s.end = time.Now()
 		s.status = failed
 	}
+}
+
+func (s *stack) updateFromChangeSetResponse(body []byte) {
+	reply := describeChangeSetResponse{}
+	err := xml.Unmarshal(body, &reply)
+	if err != nil {
+		log.WithError(err).Info("can't unmarshal aws reply; dying")
+		panic(err)
+	}
+	status := reply.DescribeChangeSetResult.Status
+	log.Info("updateFromChangeSetResponse:", status)
+	if status == "FAILED" {
+		s.end = time.Now()
+		s.status = done
+	}
+}
+
+func isCreateChangeSetAction(payload []byte) bool {
+	return strings.Contains(string(payload), "Action=CreateChangeSet&")
+}
+
+func isDescribeStacksAction(payload []byte) bool {
+	return strings.Contains(string(payload), "Action=DescribeStacks&")
+}
+
+func isDescribeChangeSetAction(payload []byte) bool {
+	return strings.Contains(string(payload), "Action=DescribeChangeSet&")
 }
 
 func (m *Manager) HandleHTTP(w http.ResponseWriter, req *http.Request) {
@@ -146,10 +191,10 @@ func (m *Manager) HandleHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 
 	s := stackFromPayload(string(payload))
-	if strings.Contains(string(payload), "Action=CreateChangeSet&") {
+	if isCreateChangeSetAction(payload) {
 		m.addStack(string(payload), s)
 		m.Broadcast()
-	} else if strings.Contains(string(payload), "Action=DescribeStacks&") {
+	} else if isDescribeStacksAction(payload) || isDescribeChangeSetAction(payload) {
 		s = m.getStack(s.name)
 	}
 
@@ -176,17 +221,23 @@ func (m *Manager) HandleHTTP(w http.ResponseWriter, req *http.Request) {
 
 	// This is a little tricky, because you only want to start updating the stack when
 	// the awscli has started causing CF to do stuff.
-	if s != nil && strings.Contains(string(payload), "Action=DescribeStacks&") {
-		if s.status == skipped {
-			_, err = io.Copy(w, s.shortCircuit(reply))
-			if err != nil {
-				log.WithError(err).Error("couldn't write reply to client")
+	if s != nil {
+		if isDescribeStacksAction(payload) {
+			if s.status == skipped {
+				_, err = io.Copy(w, s.shortCircuit(reply))
+				if err != nil {
+					log.WithError(err).Error("couldn't write reply to client")
+				}
+				return
 			}
-			return
-		}
 
-		s.updateFromDescribeResponse(reply)
-		m.Broadcast()
+			log.Info("updating from described stack!")
+			s.updateFromDescribeStacksResponse(reply)
+			m.Broadcast()
+		} else if isDescribeChangeSetAction(payload) {
+			s.updateFromChangeSetResponse(reply)
+			m.Broadcast()
+		}
 	}
 
 	_, err = io.Copy(w, bytes.NewReader(reply))
@@ -256,6 +307,7 @@ func (m *Manager) makeSlackAttachments() []slack.Attachment {
 	blocks := make([]slack.Attachment, len(m.stacks))
 
 	for i, stack := range m.stacks {
+		log.WithField("stack", stack.name).WithField("status", stack.status).Debug("stack")
 		color := colorMap[stack.status]
 		blocks[i] = slack.Attachment{Color: color, Text: stack.statusString(), ID: stack.id}
 	}
@@ -265,6 +317,10 @@ func (m *Manager) makeSlackAttachments() []slack.Attachment {
 
 func (m *Manager) Broadcast() {
 	blocks := m.makeSlackAttachments()
+
+	if len(blocks) == 0 {
+		return
+	}
 
 	header := slack.MsgOptionText(m.slackHeader, false)
 
@@ -285,10 +341,6 @@ func (m *Manager) Broadcast() {
 func (m *Manager) handleMessages() {
 	for msg := range m.rtm.IncomingEvents {
 		switch ev := msg.Data.(type) {
-		case *slack.HelloEvent:
-			ch, ts, err := m.rtm.PostMessage(m.channel, slack.MsgOptionText("let's do this", false))
-			log.WithFields(log.Fields{"ch": ch, "ts": ts, "err": err}).Debug("hello message details")
-
 		case *slack.ConnectedEvent:
 			log.Info("connected; info: ", ev.Info)
 
